@@ -1,6 +1,23 @@
 [project]
 name = "lora-landscape"
 version = "0.1.0"
-description = "Add your description here"
-requires-python = ">=3.13"
-dependencies = []
+description = "Exhaustive landscape enumeration via binary LoRA for optimizer benchmarking"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.6",
+    "transformers>=4.48",
+    "datasets>=3.0",
+    "numpy>=2.0",
+    "tqdm",
+]
+
+[tool.uv]
+index-url = "https://pypi.org/simple"
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }

@@ -13,4 +13,4 @@ build/
 .idea/
 
 # uv
-uv.lock
+# uv.lock is committed for reproducibility
