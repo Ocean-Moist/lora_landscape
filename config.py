@@ -19,7 +19,7 @@ class Config:
     # Enumeration
     num_params: int = 40  # lora_rank_q + lora_rank_v
     num_gpus: int = 8
-    config_batch_size: int = 32768  # configs evaluated in one batched forward pass
+    config_batch_size: int = 262144  # configs evaluated in one batched forward pass
     dtype: torch.dtype = torch.float16
     checkpoint_interval: int = 1024  # batches between checkpoints
 
