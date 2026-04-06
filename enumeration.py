@@ -18,8 +18,12 @@ def batched_forward(
     B_V: torch.Tensor,   # [rank_v, d_model]
     alpha: float,
     labels: torch.Tensor,  # [1, seq_len] or [seq_len]
+    lm_chunk_size: int = 8192,
 ) -> torch.Tensor:
     """Forward pass from LoRA layer through LM head for B configs.
+
+    The LM head matmul ([B*seq, 768] @ [768, 50257]) dominates memory.
+    We chunk it to allow large B for the cheaper attention + MLP ops.
 
     Returns: [B] tensor of cross-entropy losses.
     """
@@ -44,38 +48,37 @@ def batched_forward(
     V = V.view(B, seq, nh, hd).transpose(1, 2)
 
     # 4. Scaled dot-product attention (Flash Attention on H100)
-    attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)  # [B, nh, seq, hd]
-    attn_out = attn_out.transpose(1, 2).reshape(B, seq, nh * hd)       # [B, seq, 768]
+    attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+    attn_out = attn_out.transpose(1, 2).reshape(B, seq, nh * hd)
 
-    # 5. c_proj
-    attn_out = attn_out @ state.c_proj_weight + state.c_proj_bias
+    # 5. c_proj + residual
+    h = state.hidden.unsqueeze(0) + attn_out @ state.c_proj_weight + state.c_proj_bias
 
-    # 6. Residual connection (hidden is shared across batch)
-    h = state.hidden.unsqueeze(0) + attn_out  # [B, seq, 768]
+    # 6. LN2 + MLP + residual
+    h = h + state.mlp(state.ln_2(h))
 
-    # 7. Layer norm 2 + MLP + residual
-    ln2_out = state.ln_2(h)
-    mlp_out = state.mlp(ln2_out)
-    h = h + mlp_out
-
-    # 8. Final layer norm
+    # 7. Final layer norm
     h = state.ln_f(h)
 
-    # 9. LM head — only compute logits for positions where we have labels
-    # For causal LM: predict token[t+1] from position t
-    # logits at position t predicts token t+1, so we use positions [0..seq-2]
-    # labels are tokens [1..seq-1]
-    logits = h[:, :-1, :] @ state.lm_head_weight.T  # [B, seq-1, vocab_size]
+    # 8. Chunked LM head + cross-entropy (avoids materializing full [B, seq-1, 50257] logits)
+    h_shift = h[:, :-1, :].contiguous()  # [B, seq-1, 768]
+    lab = labels.squeeze(0)[1:]  # [seq-1]
+    seq_m1 = h_shift.shape[1]
 
-    # 10. Cross-entropy loss per config
-    lab = labels.squeeze(0)[1:]  # [seq-1], shift labels
-    # Flatten for cross_entropy: [B*(seq-1), vocab] vs [B*(seq-1)]
-    loss = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]),
-        lab.unsqueeze(0).expand(B, -1).reshape(-1),
-        reduction="none",
-    )
-    return loss.view(B, -1).mean(dim=1)  # [B]
+    losses = torch.empty(B, device=h.device, dtype=torch.float32)
+    for chunk_start in range(0, B, lm_chunk_size):
+        chunk_end = min(chunk_start + lm_chunk_size, B)
+        h_chunk = h_shift[chunk_start:chunk_end]  # [chunk, seq-1, 768]
+        cs = chunk_end - chunk_start
+        logits = h_chunk.reshape(cs * seq_m1, -1) @ state.lm_head_weight.T  # [chunk*seq_m1, vocab]
+        loss = F.cross_entropy(
+            logits,
+            lab.repeat(cs),
+            reduction="none",
+        ).view(cs, seq_m1).mean(dim=1)
+        losses[chunk_start:chunk_end] = loss
+
+    return losses
 
 
 def enumerate_gpu(
@@ -113,9 +116,7 @@ def enumerate_gpu(
     for batch_idx in pbar:
         batch_start = start + batch_idx * config_batch_size
         batch_end = min(batch_start + config_batch_size, end)
-        actual_size = batch_end - batch_start
 
-        # Generate config indices
         indices = torch.arange(batch_start, batch_end, device=device, dtype=torch.int64)
         binary = config_indices_to_binary(indices, num_params).to(dtype)
 
@@ -129,11 +130,9 @@ def enumerate_gpu(
                 lora_config.alpha, labels,
             )
 
-        # Write to storage
         offset = batch_idx * config_batch_size
         storage.write_batch(offset, losses.cpu().numpy().astype(np.float16))
 
-        # Checkpoint periodically
         if batch_idx % 1024 == 0:
             storage.save_checkpoint(batch_idx)
 

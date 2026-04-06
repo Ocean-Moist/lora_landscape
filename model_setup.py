@@ -69,12 +69,13 @@ class PrecomputedState:
             self.proj_V = ln1_out @ lora_config.A_V  # [seq, rank_v]
 
             # Store layer weights needed for the rest of the forward pass
-            self.c_proj_weight = attn.c_proj.weight  # [768, 768]
-            self.c_proj_bias = attn.c_proj.bias      # [768]
-            self.ln_2 = layer.ln_2
-            self.mlp = layer.mlp
-            self.ln_f = model.transformer.ln_f
-            self.lm_head_weight = model.lm_head.weight  # [vocab, 768]
+            # Ensure all weights are in the target dtype (lm_head can be fp32)
+            self.c_proj_weight = attn.c_proj.weight.to(dtype)  # [768, 768]
+            self.c_proj_bias = attn.c_proj.bias.to(dtype)      # [768]
+            self.ln_2 = layer.ln_2.to(dtype)
+            self.mlp = layer.mlp.to(dtype)
+            self.ln_f = model.transformer.ln_f.to(dtype)
+            self.lm_head_weight = model.lm_head.weight.to(dtype)  # [vocab, 768]
 
             self.num_heads = attn.num_heads  # 12
             self.head_dim = d // attn.num_heads  # 64
