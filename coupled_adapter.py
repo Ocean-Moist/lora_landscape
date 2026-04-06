@@ -50,9 +50,11 @@ class AdapterConfig:
         W1_flat[self.free_idx_w1] = 0.0
         W2_flat[self.free_idx_w2] = 0.0
 
-        # Store the magnitude at free positions (for scaling the binary params)
-        self.free_scale_w1 = W1_init.reshape(-1)[self.free_idx_w1].abs().clamp(min=scale1)
-        self.free_scale_w2 = W2_init.reshape(-1)[self.free_idx_w2].abs().clamp(min=scale2)
+        # Free params need LARGE scale relative to frozen weights to be impactful.
+        # Each free param is one entry in W1 or W2. With small init scale (~0.05),
+        # a binary flip barely registers. Use 10x init scale for clear signal.
+        self.free_scale_w1 = torch.full((n_w1,), scale1 * 10.0)
+        self.free_scale_w2 = torch.full((n_w2,), scale2 * 10.0)
 
         self.W1_base = W1_flat.reshape(width, d_model).to(device=device, dtype=dtype)
         self.W2_base = W2_flat.reshape(d_model, width).to(device=device, dtype=dtype)

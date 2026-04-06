@@ -14,7 +14,7 @@ from pathlib import Path
 from coupled_config import CoupledConfig
 from coupled_adapter import AdapterConfig, config_indices_to_binary
 from coupled_data import load_eval_sequences
-from coupled_enumeration import run_layers, compute_loss
+from coupled_enumeration import run_layers_batched as run_layers, run_layers_single
 
 
 # ---- STE for binary quantization ----

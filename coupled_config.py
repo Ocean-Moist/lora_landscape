@@ -13,12 +13,13 @@ class CoupledConfig:
     adapter_layers: tuple = (2, 6, 11)  # insertion points in transformer
     bottleneck_width: int = 4  # 768 -> w -> 768
     bits_per_adapter: int = 8  # free binary params per adapter
-    adapter_alpha: float = 0.5  # scaling for adapter output
+    adapter_alpha: float = 2.0  # scaling for adapter output
     adapter_seed: int = 42
 
-    # Dataset — enough sequences for representational pressure
-    num_sequences: int = 16
-    seq_len: int = 64
+    # Dataset — enough sequences for representational pressure, but small
+    # enough that attention scores [B, 12, seq, seq] fit in GPU memory
+    num_sequences: int = 4
+    seq_len: int = 32  # 4*32 = 128 tokens total
     dataset_name: str = "wikitext"
     dataset_config: str = "wikitext-2-raw-v1"
 
