@@ -7,8 +7,8 @@ class Config:
     # Model
     model_name: str = "gpt2"
     lora_layer: int = 11  # last transformer layer — minimizes per-config compute
-    lora_rank_q: int = 20
-    lora_rank_v: int = 20
+    lora_rank_q: int = 15
+    lora_rank_v: int = 15
     lora_alpha: float = 25.0
     lora_seed: int = 42
 
