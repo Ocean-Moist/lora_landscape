@@ -47,8 +47,14 @@ def batched_forward(
     K = K.view(B, seq, nh, hd).transpose(1, 2)
     V = V.view(B, seq, nh, hd).transpose(1, 2)
 
-    # 4. Scaled dot-product attention (Flash Attention on H100)
-    attn_out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+    # 4. Attention — manual for short sequences (Flash Attention fails at large B with short seq)
+    scale = hd ** -0.5
+    scores = (Q @ K.transpose(-2, -1)) * scale  # [B, nh, seq, seq]
+    # Causal mask
+    mask = torch.triu(torch.ones(seq, seq, device=Q.device, dtype=torch.bool), diagonal=1)
+    scores.masked_fill_(mask, float("-inf"))
+    attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
+    attn_out = attn_weights @ V  # [B, nh, seq, hd]
     attn_out = attn_out.transpose(1, 2).reshape(B, seq, nh * hd)
 
     # 5. c_proj + residual
