@@ -40,8 +40,8 @@ def differentiable_forward(
     labels: torch.Tensor,
 ) -> torch.Tensor:
     """Forward pass with STE quantization. Returns [N_runs] losses with grad."""
-    # Quantize via STE
-    quantized = ste_ternary(latent)
+    # Quantize via STE, cast to model dtype
+    quantized = ste_ternary(latent).to(state.hidden.dtype)
     m_Q = quantized[:, :lora_config.rank_q]
     m_V = quantized[:, lora_config.rank_q:]
 
