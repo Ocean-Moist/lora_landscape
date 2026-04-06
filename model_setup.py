@@ -44,7 +44,7 @@ class PrecomputedState:
             hidden = model.transformer.wte(input_ids.to(device)) + model.transformer.wpe(
                 torch.arange(input_ids.shape[1], device=device)
             )
-            hidden = hidden.to(dtype)
+            hidden = hidden.to(dtype)  # [1, seq, 768]
             for i in range(lora_layer):
                 hidden = model.transformer.h[i](hidden)[0]
 
@@ -57,7 +57,7 @@ class PrecomputedState:
 
             # GPT-2 c_attn is Conv1D: output = input @ weight + bias
             # weight: [768, 2304], bias: [2304]
-            ln1_out = layer.ln_1(self.hidden.unsqueeze(0)).squeeze(0)  # [seq, 768]
+            ln1_out = layer.ln_1(hidden).squeeze(0)  # [seq, 768]
 
             qkv = ln1_out @ attn.c_attn.weight + attn.c_attn.bias  # [seq, 2304]
             d = attn.c_attn.weight.shape[0]  # 768
