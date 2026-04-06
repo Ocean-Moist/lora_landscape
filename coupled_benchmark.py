@@ -61,40 +61,35 @@ def differentiable_coupled_forward(
     flat_ids = input_ids.reshape(1, -1)
     flat_labels = labels.reshape(-1)
 
-    # Embeddings (shared across runs)
+    # Embeddings + layers before first adapter (no grad needed here)
     with torch.no_grad():
         embeds = model.transformer.wte(flat_ids) + model.transformer.wpe(
             torch.arange(total_seq, device=input_ids.device).unsqueeze(0))
         embeds = model.transformer.drop(embeds).squeeze(0)  # [seq, d]
+        h_pre = run_layers_single(model, embeds, 0, adapter_layers[0])
+        # h_pre: [total_seq, d] — no grad, used as starting point
 
-    h = embeds.unsqueeze(0).expand(N, -1, -1)  # [N, seq, d]
+    h = h_pre.unsqueeze(0).expand(N, -1, -1)  # [N, seq, d]
 
-    # Run through model with adapters at each insertion point
-    prev_layer = 0
+    # Apply adapters + run intermediate frozen layers WITH grad flow
+    # Frozen params have requires_grad=False so no extra param grads computed,
+    # but hidden state gradients flow back to adapter outputs → STE → latent
     for adapter_idx, layer_idx in enumerate(adapter_layers):
-        # Frozen layers before this adapter
-        with torch.no_grad():
-            h = run_layers(model, h, prev_layer, layer_idx)
-
         # Apply adapter with STE-quantized weights
         bits = quantized[:, adapter_idx * n_per:(adapter_idx + 1) * n_per]
         W1, W2 = adapters[adapter_idx].build_weights(bits)
-        # MLP adapter
         bottleneck = torch.bmm(h, W1.transpose(1, 2))
         bottleneck = F.relu(bottleneck)
         out = torch.bmm(bottleneck, W2.transpose(1, 2))
         h = h + adapters[adapter_idx].alpha * out
 
-        prev_layer = layer_idx
+        # Run frozen layers after this adapter (grad flows through)
+        next_layer = adapter_layers[adapter_idx + 1] if adapter_idx + 1 < len(adapter_layers) else adapter_layers[-1] + 1
+        h = run_layers(model, h, layer_idx, next_layer)
 
-    # Run remaining layers (adapter_layers[-1] through end)
-    with torch.no_grad():
-        h = run_layers(model, h, adapter_layers[-1], adapter_layers[-1] + 1)
-        # Final LN + LM head
-        h = model.transformer.ln_f(h)
-
-    # LM head with grad (through adapter params only)
-    logits = h @ model.lm_head.weight.T  # [N, seq, vocab]
+    # Final LN + LM head (with grad)
+    h = model.transformer.ln_f(h)
+    logits = h @ model.lm_head.weight.to(dtype).T  # [N, seq, vocab]
     chunk_losses = F.cross_entropy(
         logits.reshape(-1, logits.shape[-1]),
         flat_labels.unsqueeze(0).expand(N, -1).reshape(-1),
@@ -232,7 +227,7 @@ def run_gradient_benchmark(
     name: str, optimizer_cls, optimizer_kwargs: dict,
     model, adapters, input_ids, labels, cfg,
     n_runs: int = 5000, max_steps: int = 50,
-    global_min_loss: float = 0.0, chunk_size: int = 512,
+    global_min_loss: float = 0.0, chunk_size: int = 128,
 ) -> dict:
     """Run gradient-based optimizer benchmark."""
     device = input_ids.device
