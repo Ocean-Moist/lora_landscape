@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 
-from binary_lora import config_indices_to_binary, apply_binary_lora_batched
+from binary_lora import config_indices_to_ternary, apply_binary_lora_batched
 from model_setup import PrecomputedState
 from storage import LossStorage
 
@@ -121,10 +121,10 @@ def enumerate_gpu(
         batch_end = min(batch_start + config_batch_size, end)
 
         indices = torch.arange(batch_start, batch_end, device=device, dtype=torch.int64)
-        binary = config_indices_to_binary(indices, num_params).to(dtype)
+        ternary = config_indices_to_ternary(indices, num_params).to(dtype)
 
-        m_Q = binary[:, :lora_config.rank_q]
-        m_V = binary[:, lora_config.rank_q:]
+        m_Q = ternary[:, :lora_config.rank_q]
+        m_V = ternary[:, lora_config.rank_q:]
 
         with torch.no_grad():
             losses = batched_forward(

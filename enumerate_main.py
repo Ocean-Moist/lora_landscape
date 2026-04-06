@@ -1,4 +1,4 @@
-"""Multi-GPU entry point for exhaustive binary LoRA enumeration."""
+"""Multi-GPU entry point for exhaustive ternary LoRA enumeration."""
 
 import argparse
 import torch
@@ -34,13 +34,12 @@ def worker(gpu_id: int, cfg: Config):
     print(f"[GPU {gpu_id}] Precomputing layer 0-{cfg.lora_layer - 1} activations...")
     state = PrecomputedState(model, input_ids, lora_cfg, cfg.lora_layer, device, cfg.dtype)
 
-    # Free the full model — we only need the precomputed state
     del model
     torch.cuda.empty_cache()
 
     storage = LossStorage(cfg.output_dir, gpu_id, cfg.total_configs, cfg.num_gpus)
 
-    print(f"[GPU {gpu_id}] Starting enumeration...")
+    print(f"[GPU {gpu_id}] Starting enumeration ({cfg.total_configs:,} configs, {cfg.num_levels}-ary, {cfg.num_params} params)...")
     enumerate_gpu(
         gpu_id=gpu_id,
         num_gpus=cfg.num_gpus,
@@ -56,24 +55,34 @@ def worker(gpu_id: int, cfg: Config):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Exhaustive binary LoRA enumeration")
+    parser = argparse.ArgumentParser(description="Exhaustive ternary LoRA enumeration")
     parser.add_argument("--gpus", type=int, default=8, help="Number of GPUs")
-    parser.add_argument("--batch-size", type=int, default=4096, help="Configs per batch")
+    parser.add_argument("--batch-size", type=int, default=None, help="Configs per batch")
     parser.add_argument("--output-dir", type=str, default=None, help="Override output directory")
     parser.add_argument("--test", action="store_true", help="Quick test: 10 batches on 1 GPU")
     args = parser.parse_args()
 
     cfg = Config()
     cfg.num_gpus = args.gpus
-    cfg.config_batch_size = args.batch_size
+    if args.batch_size:
+        cfg.config_batch_size = args.batch_size
     if args.output_dir:
         cfg.output_dir = args.output_dir
 
+    # total_configs must be evenly divisible by num_gpus
+    # For 3^19 = 1,162,261,467, round down to nearest multiple of num_gpus
+    remainder = cfg.total_configs % cfg.num_gpus
+    if remainder != 0:
+        cfg.total_configs -= remainder
+        print(f"Adjusted total_configs to {cfg.total_configs:,} (divisible by {cfg.num_gpus})")
+
+    print(f"Enumerating {cfg.total_configs:,} configs ({cfg.num_levels}^{cfg.num_params})")
+    print(f"  {cfg.num_gpus} GPUs, batch_size={cfg.config_batch_size}")
+
     if args.test:
         cfg.num_gpus = 1
-        # Override total_configs for quick test
         cfg.total_configs = cfg.config_batch_size * 10
-        print(f"Test mode: {cfg.total_configs} configs on 1 GPU")
+        print(f"Test mode: {cfg.total_configs:,} configs on 1 GPU")
         worker(0, cfg)
         return
 

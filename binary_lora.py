@@ -1,21 +1,19 @@
-"""Binary LoRA parameterization: A @ diag(m) @ B where m ∈ {-1, +1}^r.
+"""Quantized LoRA parameterization: A @ diag(m) @ B where m ∈ {-1, 0, +1}^r (ternary).
 
-Each binary parameter toggles one rank-1 perturbation direction.
-The landscape over m is a genuine cross-section of the pretrained model's loss surface.
+Each parameter toggles or disables one rank-1 perturbation direction.
+The zero state creates genuine parameter interactions — a direction being "off"
+changes how other directions affect loss.
 """
 
 import torch
-import torch.nn as nn
 
 
 class BinaryLoRAConfig:
-    """Frozen random projections for binary LoRA on Q and V."""
+    """Frozen random projections for quantized LoRA on Q and V."""
 
     def __init__(self, d_model: int, rank_q: int, rank_v: int, alpha: float, seed: int, device: torch.device, dtype: torch.dtype):
         rng = torch.Generator(device="cpu").manual_seed(seed)
 
-        # A: [d_model, rank], B: [rank, d_model] — frozen random directions
-        # Normalize so perturbation magnitude is controlled by alpha alone
         self.A_Q = self._make_A(d_model, rank_q, rng).to(device=device, dtype=dtype)
         self.B_Q = self._make_B(rank_q, d_model, rng).to(device=device, dtype=dtype)
         self.A_V = self._make_A(d_model, rank_v, rng).to(device=device, dtype=dtype)
@@ -27,55 +25,58 @@ class BinaryLoRAConfig:
     @staticmethod
     def _make_A(d_model: int, rank: int, rng: torch.Generator) -> torch.Tensor:
         A = torch.randn(d_model, rank, generator=rng)
-        A = A / A.norm(dim=0, keepdim=True)  # unit-norm columns
+        A = A / A.norm(dim=0, keepdim=True)
         return A
 
     @staticmethod
     def _make_B(rank: int, d_model: int, rng: torch.Generator) -> torch.Tensor:
         B = torch.randn(rank, d_model, generator=rng)
-        B = B / B.norm(dim=1, keepdim=True)  # unit-norm rows
+        B = B / B.norm(dim=1, keepdim=True)
         return B
 
 
-def config_indices_to_binary(indices: torch.Tensor, num_params: int) -> torch.Tensor:
-    """Convert integer config indices to binary vectors in {-1, +1}.
+def config_indices_to_ternary(indices: torch.Tensor, num_params: int) -> torch.Tensor:
+    """Convert integer config indices to ternary vectors in {-1, 0, +1}.
+
+    Uses base-3 decomposition: digit d maps to d - 1, so {0,1,2} -> {-1,0,+1}.
 
     Args:
         indices: [B] int64 tensor of config indices
-        num_params: total binary params (e.g. 40)
+        num_params: total params (e.g. 19)
 
     Returns:
-        [B, num_params] float tensor with values in {-1, +1}
-        Bits 0..rank_q-1 -> m_Q, bits rank_q..num_params-1 -> m_V
+        [B, num_params] float tensor with values in {-1, 0, +1}
     """
-    # bits[i, j] = (indices[i] >> j) & 1
+    B = indices.shape[0]
+    digits = torch.zeros(B, num_params, device=indices.device, dtype=torch.int64)
+    remaining = indices.clone()
+    for k in range(num_params):
+        digits[:, k] = remaining % 3
+        remaining //= 3
+    return (digits - 1).float()  # {0,1,2} -> {-1,0,+1}
+
+
+# Keep old name for compatibility
+def config_indices_to_binary(indices: torch.Tensor, num_params: int) -> torch.Tensor:
+    """Binary version for backwards compat. Use config_indices_to_ternary for ternary."""
     shifts = torch.arange(num_params, device=indices.device, dtype=torch.int64)
     bits = (indices.unsqueeze(1) >> shifts.unsqueeze(0)) & 1
-    return bits.float() * 2 - 1  # {0,1} -> {-1,+1}
+    return bits.float() * 2 - 1
 
 
 def apply_binary_lora_batched(
-    proj_Q: torch.Tensor,  # [seq, rank_q] — precomputed hidden @ A_Q
-    proj_V: torch.Tensor,  # [seq, rank_v] — precomputed hidden @ A_V
-    m_Q: torch.Tensor,     # [B, rank_q] — binary config vectors for Q
-    m_V: torch.Tensor,     # [B, rank_v] — binary config vectors for V
-    B_Q: torch.Tensor,     # [rank_q, d_model]
-    B_V: torch.Tensor,     # [rank_v, d_model]
+    proj_Q: torch.Tensor,
+    proj_V: torch.Tensor,
+    m_Q: torch.Tensor,
+    m_V: torch.Tensor,
+    B_Q: torch.Tensor,
+    B_V: torch.Tensor,
     alpha: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute batched LoRA deltas for Q and V projections.
+    """Compute batched LoRA deltas. Works for any quantization (binary/ternary/4-level).
 
-    delta_Q[b] = (proj_Q * m_Q[b]) @ B_Q * alpha
-               = proj_Q @ diag(m_Q[b]) @ B_Q * alpha
-
-    Returns:
-        delta_Q: [B, seq, d_model]
-        delta_V: [B, seq, d_model]
+    delta_Q[b] = proj_Q @ diag(m_Q[b]) @ B_Q * alpha
     """
-    # proj_Q: [seq, rank_q] -> [1, seq, rank_q]
-    # m_Q:    [B, rank_q]   -> [B, 1, rank_q]
-    # element-wise multiply -> [B, seq, rank_q]
-    # matmul with B_Q [rank_q, d_model] -> [B, seq, d_model]
     delta_Q = (proj_Q.unsqueeze(0) * m_Q.unsqueeze(1)) @ B_Q * alpha
     delta_V = (proj_V.unsqueeze(0) * m_V.unsqueeze(1)) @ B_V * alpha
     return delta_Q, delta_V
