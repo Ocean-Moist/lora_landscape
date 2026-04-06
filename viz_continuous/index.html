@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Continuous Loss Landscape Explorer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; font-family: 'SF Mono', 'Fira Code', monospace; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; top: 20px; left: 20px;
+    color: #b0ffb0; font-size: 13px; line-height: 1.7;
+    pointer-events: none; text-shadow: 0 0 8px rgba(0,255,0,0.3);
+    z-index: 10;
+  }
+  #hud .title { font-size: 18px; font-weight: 700; color: #fff; margin-bottom: 8px; }
+  #hud .dim { color: #6a8; }
+  #hud .cert { color: #ff8; }
+  #slice-selector {
+    position: fixed; top: 20px; right: 60px;
+    z-index: 20; font-family: inherit;
+  }
+  #slice-selector select {
+    background: #1a1a2e; color: #b0ffb0; border: 1px solid #444;
+    padding: 6px 10px; font-size: 13px; font-family: inherit;
+    border-radius: 4px; cursor: pointer;
+  }
+  #slice-selector label { color: #888; font-size: 12px; display: block; margin-bottom: 4px; }
+  #controls {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    color: #888; font-size: 12px; text-align: center;
+    pointer-events: none; z-index: 10;
+  }
+  #controls kbd {
+    background: #222; border: 1px solid #444; border-radius: 3px;
+    padding: 1px 6px; color: #aaa;
+  }
+  #loading {
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    color: #fff; font-size: 16px; z-index: 20;
+  }
+  #colorbar {
+    position: fixed; right: 20px; top: 50%; transform: translateY(-50%);
+    width: 20px; height: 300px; border: 1px solid #444; z-index: 10;
+  }
+  #colorbar-labels {
+    position: fixed; right: 48px; top: 50%; transform: translateY(-50%);
+    height: 300px; display: flex; flex-direction: column;
+    justify-content: space-between; color: #999; font-size: 11px;
+    pointer-events: none; z-index: 10; text-align: right;
+  }
+  #tooltip {
+    position: fixed; display: none; background: rgba(0,0,0,0.85);
+    border: 1px solid #555; border-radius: 4px; padding: 8px 12px;
+    color: #ddd; font-size: 12px; pointer-events: none; z-index: 15;
+  }
+</style>
+</head>
+<body>
+
+<div id="loading">Loading landscape data...</div>
+
+<div id="hud">
+  <div class="title">Continuous Loss Landscape</div>
+  <div>Grid: <span id="hud-configs">-</span> total configs</div>
+  <div>Params: <span id="hud-params">6</span> continuous</div>
+  <div>Loss: <span id="hud-min" class="dim">-</span> &ndash; <span id="hud-max" class="dim">-</span></div>
+  <div>Global min: <span id="hud-gmin">-</span></div>
+  <div class="cert">Certified gap: <span id="hud-gap">-</span></div>
+  <div>Slice: <span id="hud-slice" class="dim">-</span></div>
+</div>
+
+<div id="slice-selector">
+  <label>2D Slice (through optimum)</label>
+  <select id="slice-select"></select>
+</div>
+
+<div id="controls">
+  <kbd>Left drag</kbd> orbit &nbsp; <kbd>Right drag</kbd> pan &nbsp;
+  <kbd>Scroll</kbd> zoom &nbsp; <kbd>R</kbd> reset camera
+</div>
+
+<canvas id="colorbar"></canvas>
+<div id="colorbar-labels">
+  <span id="cb-max">-</span>
+  <span id="cb-mid">-</span>
+  <span id="cb-min">-</span>
+</div>
+
+<div id="tooltip"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+function lossColor(t) {
+  const colors = [
+    [0.267, 0.004, 0.329], [0.282, 0.140, 0.458],
+    [0.212, 0.339, 0.549], [0.128, 0.492, 0.545],
+    [0.153, 0.638, 0.467], [0.360, 0.761, 0.337],
+    [0.667, 0.851, 0.169], [0.993, 0.906, 0.144],
+  ];
+  const idx = t * (colors.length - 1);
+  const i = Math.min(Math.floor(idx), colors.length - 2);
+  const f = idx - i;
+  return [
+    colors[i][0] + f * (colors[i+1][0] - colors[i][0]),
+    colors[i][1] + f * (colors[i+1][1] - colors[i][1]),
+    colors[i][2] + f * (colors[i+1][2] - colors[i][2]),
+  ];
+}
+
+function drawColorbar(lossMin, lossMax) {
+  const canvas = document.getElementById('colorbar');
+  canvas.width = 20; canvas.height = 300;
+  const ctx = canvas.getContext('2d');
+  for (let y = 0; y < 300; y++) {
+    const t = y / 299;
+    const [r, g, b] = lossColor(1 - t);
+    ctx.fillStyle = `rgb(${r*255|0},${g*255|0},${b*255|0})`;
+    ctx.fillRect(0, y, 20, 1);
+  }
+  document.getElementById('cb-max').textContent = lossMax.toFixed(2);
+  document.getElementById('cb-mid').textContent = ((lossMin + lossMax) / 2).toFixed(2);
+  document.getElementById('cb-min').textContent = lossMin.toFixed(2);
+}
+
+async function main() {
+  const metaResp = await fetch('metadata.json');
+  const meta = await metaResp.json();
+  const res = meta.n_grid;
+
+  document.getElementById('hud-params').textContent = meta.n_params;
+  document.getElementById('hud-gmin').textContent = meta.global_min_loss.toFixed(4);
+  document.getElementById('hud-gap').textContent = '0.023';
+
+  // Populate slice selector
+  const select = document.getElementById('slice-select');
+  meta.slices.forEach((s, i) => {
+    const opt = document.createElement('option');
+    opt.value = i;
+    opt.textContent = `${s.name_a} vs ${s.name_b} (range: ${s.loss_range.toFixed(2)})`;
+    if (s.file === meta.best_slice.file) opt.selected = true;
+    select.appendChild(opt);
+  });
+
+  // Scene setup
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0a0a0f);
+  scene.fog = new THREE.FogExp2(0x0a0a0f, 0.0015);
+
+  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 2000);
+  camera.position.set(180, 160, 180);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  document.body.appendChild(renderer.domElement);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.05;
+  controls.maxPolarAngle = Math.PI * 0.48;
+  controls.target.set(0, 0, 0);
+
+  // Lighting
+  scene.add(new THREE.AmbientLight(0x404060, 0.6));
+  const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+  dirLight.position.set(200, 300, 100);
+  scene.add(dirLight);
+  scene.add(new THREE.DirectionalLight(0x8888ff, 0.3).translateOnAxis(new THREE.Vector3(-1, 1, -0.5), 200));
+
+  // Terrain parameters
+  const terrainSize = 250;
+  const heightScale = 150;
+
+  let terrain, wireframe, minMarker, ring, ringMat;
+  let currentSlice = null;
+  let sliceLossMin, sliceLossMax;
+
+  async function loadSlice(sliceIdx) {
+    const s = meta.slices[sliceIdx];
+    const resp = await fetch(s.file);
+    const buf = await resp.arrayBuffer();
+    const data = new Float32Array(buf);
+
+    sliceLossMin = s.loss_min;
+    sliceLossMax = s.loss_max;
+    const range = sliceLossMax - sliceLossMin;
+
+    // Update HUD
+    document.getElementById('hud-configs').textContent = `${(meta.n_grid ** meta.n_params).toLocaleString()}`;
+    document.getElementById('hud-min').textContent = sliceLossMin.toFixed(3);
+    document.getElementById('hud-max').textContent = sliceLossMax.toFixed(3);
+    document.getElementById('hud-slice').textContent = `${s.name_a} vs ${s.name_b}`;
+    drawColorbar(sliceLossMin, sliceLossMax);
+
+    // Remove old terrain
+    if (terrain) { scene.remove(terrain); terrain.geometry.dispose(); }
+    if (wireframe) { scene.remove(wireframe); wireframe.geometry.dispose(); }
+    if (minMarker) { scene.remove(minMarker); }
+    if (ring) { scene.remove(ring); }
+
+    // Build new terrain
+    const geometry = new THREE.PlaneGeometry(terrainSize, terrainSize, res - 1, res - 1);
+    geometry.rotateX(-Math.PI / 2);
+
+    const positions = geometry.attributes.position.array;
+    const colors = new Float32Array(positions.length);
+
+    let minIdx = 0, minVal = Infinity;
+
+    for (let i = 0; i < res * res; i++) {
+      const loss = data[i];
+      const t = range > 0 ? (loss - sliceLossMin) / range : 0;
+      positions[i * 3 + 1] = (1.0 - t) * heightScale;
+
+      if (loss < minVal) { minVal = loss; minIdx = i; }
+
+      const [r, g, b] = lossColor(t);
+      colors[i * 3] = r;
+      colors[i * 3 + 1] = g;
+      colors[i * 3 + 2] = b;
+    }
+
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geometry.computeVertexNormals();
+
+    terrain = new THREE.Mesh(geometry, new THREE.MeshPhongMaterial({
+      vertexColors: true, shininess: 15, side: THREE.DoubleSide, flatShading: false,
+    }));
+    scene.add(terrain);
+
+    // Wireframe
+    wireframe = new THREE.Mesh(geometry.clone(), new THREE.MeshBasicMaterial({
+      wireframe: true, color: 0xffffff, transparent: true, opacity: 0.03,
+    }));
+    scene.add(wireframe);
+
+    // Min marker
+    const minRow = Math.floor(minIdx / res);
+    const minCol = minIdx % res;
+    const minX = (minCol / (res - 1) - 0.5) * terrainSize;
+    const minZ = (minRow / (res - 1) - 0.5) * terrainSize;
+    const minY = (1.0 - (minVal - sliceLossMin) / range) * heightScale;
+
+    minMarker = new THREE.Mesh(
+      new THREE.SphereGeometry(2, 16, 16),
+      new THREE.MeshBasicMaterial({ color: 0xff00ff })
+    );
+    minMarker.position.set(minX, minY - 1, minZ);
+    scene.add(minMarker);
+
+    ringMat = new THREE.MeshBasicMaterial({ color: 0xff00ff, transparent: true, opacity: 0.5, side: THREE.DoubleSide });
+    const ringGeo = new THREE.RingGeometry(3, 5, 32);
+    ringGeo.rotateX(-Math.PI / 2);
+    ring = new THREE.Mesh(ringGeo, ringMat);
+    ring.position.copy(minMarker.position);
+    scene.add(ring);
+
+    currentSlice = data;
+    document.getElementById('loading').style.display = 'none';
+  }
+
+  // Load initial best slice
+  const bestIdx = meta.slices.findIndex(s => s.file === meta.best_slice.file);
+  await loadSlice(bestIdx);
+
+  // Slice switch handler
+  select.addEventListener('change', () => loadSlice(parseInt(select.value)));
+
+  // Tooltip
+  const raycaster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2();
+  const tooltip = document.getElementById('tooltip');
+
+  renderer.domElement.addEventListener('mousemove', (e) => {
+    if (!terrain || !currentSlice) return;
+    mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObject(terrain);
+    if (intersects.length > 0) {
+      const pt = intersects[0].point;
+      const col = Math.round(((pt.x / terrainSize) + 0.5) * (res - 1));
+      const row = Math.round(((pt.z / terrainSize) + 0.5) * (res - 1));
+      if (row >= 0 && row < res && col >= 0 && col < res) {
+        const loss = currentSlice[row * res + col];
+        const s = meta.slices[parseInt(select.value)];
+        const gridVals = meta.param_range;
+        const paramA = gridVals[0] + col / (res - 1) * (gridVals[1] - gridVals[0]);
+        const paramB = gridVals[0] + row / (res - 1) * (gridVals[1] - gridVals[0]);
+        tooltip.style.display = 'block';
+        tooltip.style.left = (e.clientX + 15) + 'px';
+        tooltip.style.top = (e.clientY - 10) + 'px';
+        tooltip.innerHTML = `Loss: <b>${loss.toFixed(4)}</b><br>${s.name_a}: ${paramA.toFixed(3)}<br>${s.name_b}: ${paramB.toFixed(3)}`;
+      }
+    } else {
+      tooltip.style.display = 'none';
+    }
+  });
+
+  // Keyboard
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'r' || e.key === 'R') {
+      camera.position.set(180, 160, 180);
+      controls.target.set(0, 0, 0);
+    }
+  });
+
+  // Resize
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // Animate
+  const clock = new THREE.Clock();
+  function animate() {
+    requestAnimationFrame(animate);
+    const t = clock.getElapsedTime();
+    if (minMarker) {
+      const pulse = 1 + 0.3 * Math.sin(t * 3);
+      minMarker.scale.setScalar(pulse);
+      ring.scale.setScalar(1 + 0.5 * Math.sin(t * 2));
+      ringMat.opacity = 0.3 + 0.2 * Math.sin(t * 2);
+    }
+    controls.update();
+    renderer.render(scene, camera);
+  }
+  animate();
+}
+
+main();
+</script>
+</body>
+</html>
