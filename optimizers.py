@@ -19,12 +19,11 @@ from model_setup import PrecomputedState
 class STETernary(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
-        # Quantize to {-1, 0, +1}: round and clamp
         return torch.clamp(torch.round(x), -1, 1)
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output  # straight-through
+        return grad_output
 
 
 def ste_ternary(x):
@@ -47,13 +46,11 @@ def differentiable_forward(
 
     B = latent.shape[0]
 
-    # LoRA deltas
     delta_Q, delta_V = apply_binary_lora_batched(
         state.proj_Q, state.proj_V, m_Q, m_V,
         lora_config.B_Q, lora_config.B_V, lora_config.alpha,
     )
 
-    # Full Q, V, K
     Q = state.Q_base.unsqueeze(0) + delta_Q
     V = state.V_base.unsqueeze(0) + delta_V
     K = state.K.unsqueeze(0).expand(B, -1, -1)
@@ -66,7 +63,6 @@ def differentiable_forward(
     K = K.view(B, seq, nh, hd).transpose(1, 2)
     V = V.view(B, seq, nh, hd).transpose(1, 2)
 
-    # Attention
     scale = hd ** -0.5
     scores = (Q @ K.transpose(-2, -1)) * scale
     mask = torch.triu(torch.ones(seq, seq, device=Q.device, dtype=torch.bool), diagonal=1)
@@ -75,16 +71,10 @@ def differentiable_forward(
     attn_out = attn_weights @ V
     attn_out = attn_out.transpose(1, 2).reshape(B, seq, nh * hd)
 
-    # c_proj + residual
     h = state.hidden.unsqueeze(0) + attn_out @ state.c_proj_weight + state.c_proj_bias
-
-    # LN2 + MLP + residual
     h = h + state.mlp(state.ln_2(h))
-
-    # Final LN
     h = state.ln_f(h)
 
-    # LM head — last position only
     h_last = h[:, -2, :]
     target = labels.squeeze(0)[-1]
 
@@ -99,22 +89,22 @@ class Muon(torch.optim.Optimizer):
     """MUON: Momentum with Orthogonalization via Newton-Schulz.
 
     For matrix-shaped momentum, applies polar decomposition approximation.
-    For vector params, falls back to normalized momentum (equivalent behavior).
+    Splits parameters by rank_q / rank_v for proper matrix reshaping.
     """
 
-    def __init__(self, params, lr=0.02, momentum=0.95, ns_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, ns_steps=ns_steps)
+    def __init__(self, params, lr=0.02, momentum=0.95, ns_steps=5,
+                 rank_q=10, rank_v=9):
+        defaults = dict(lr=lr, momentum=momentum, ns_steps=ns_steps,
+                        rank_q=rank_q, rank_v=rank_v)
         super().__init__(params, defaults)
 
     @staticmethod
     def _newton_schulz(G, steps=5):
         """Approximate the orthogonal factor of the polar decomposition."""
-        # Only works for 2D tensors (matrices)
-        if G.dim() != 2:
-            return G / (G.norm() + 1e-8)
-
         a, b, c = (3.4445, -4.7750, 2.0315)
         X = G / (G.norm() + 1e-7)
+        if G.dim() < 2 or min(G.shape) < 2:
+            return X
         for _ in range(steps):
             A = X @ X.T
             B = b * A + c * A @ A
@@ -127,6 +117,8 @@ class Muon(torch.optim.Optimizer):
             lr = group["lr"]
             mu = group["momentum"]
             ns_steps = group["ns_steps"]
+            rank_q = group["rank_q"]
+            rank_v = group["rank_v"]
 
             for p in group["params"]:
                 if p.grad is None:
@@ -140,23 +132,49 @@ class Muon(torch.optim.Optimizer):
                 buf = state["momentum_buffer"]
                 buf.mul_(mu).add_(g)
 
-                # Orthogonalize: reshape to matrix if needed
-                shape = buf.shape
-                if buf.dim() == 1:
-                    # Reshape vector to ~square matrix for Newton-Schulz
-                    n = buf.shape[0]
-                    # Find closest factorization
-                    rows = int(n ** 0.5)
-                    while n % rows != 0 and rows > 1:
-                        rows -= 1
-                    cols = n // rows
-                    buf_mat = buf.view(rows, cols)
-                    orth = self._newton_schulz(buf_mat, ns_steps)
-                    update = orth.view(shape)
+                if buf.dim() == 2:
+                    # Batched params: [N_runs, num_params]
+                    # Split into Q and V, reshape each to matrix, orthogonalize
+                    buf_q = buf[:, :rank_q]  # [N, 10]
+                    buf_v = buf[:, rank_q:]  # [N, 9]
+
+                    # Reshape Q: 10 -> 2x5, V: 9 -> 3x3
+                    rq, cq = self._factor(rank_q)
+                    rv, cv = self._factor(rank_v)
+
+                    # Per-run orthogonalization
+                    N = buf.shape[0]
+                    orth_q = self._batch_newton_schulz(buf_q.view(N, rq, cq), ns_steps)
+                    orth_v = self._batch_newton_schulz(buf_v.view(N, rv, cv), ns_steps)
+
+                    update = torch.cat([orth_q.view(N, rank_q), orth_v.view(N, rank_v)], dim=1)
                 else:
-                    update = self._newton_schulz(buf.clone(), ns_steps)
+                    update = buf / (buf.norm() + 1e-8)
 
                 p.add_(update, alpha=-lr)
+
+    @staticmethod
+    def _factor(n):
+        """Find closest-to-square factorization of n."""
+        rows = int(n ** 0.5)
+        while n % rows != 0 and rows > 1:
+            rows -= 1
+        return rows, n // rows
+
+    @staticmethod
+    def _batch_newton_schulz(G, steps=5):
+        """Batched Newton-Schulz on [N, rows, cols] tensors."""
+        a, b, c = (3.4445, -4.7750, 2.0315)
+        # Normalize per-sample
+        norms = G.norm(dim=(1, 2), keepdim=True).clamp(min=1e-7)
+        X = G / norms
+        if min(G.shape[1], G.shape[2]) < 2:
+            return X
+        for _ in range(steps):
+            A = X @ X.transpose(-1, -2)  # [N, rows, rows]
+            B = b * A + c * A @ A
+            X = a * X + B @ X
+        return X
 
 
 # ---- Benchmark runner ----
@@ -168,15 +186,16 @@ class BenchmarkResult:
     max_steps: int
     global_min_loss: float
 
-    # Per-run results
-    final_losses: np.ndarray    # [n_runs]
-    best_losses: np.ndarray     # [n_runs] — best loss seen during run
-    steps_to_best: np.ndarray   # [n_runs] — step at which best loss was found
-    final_configs: np.ndarray   # [n_runs, num_params] — final ternary config
+    final_losses: np.ndarray
+    best_losses: np.ndarray
+    steps_to_best: np.ndarray
+    final_configs: np.ndarray
+
+    # Landscape percentile of best loss (set after creation)
+    best_loss_landscape_percentile: float = 0.0
 
     @property
     def success_rate(self):
-        """Fraction of runs that found the global optimum."""
         return float(np.mean(np.isclose(self.best_losses, self.global_min_loss, atol=0.01)))
 
     @property
@@ -196,12 +215,18 @@ class BenchmarkResult:
             f"  Global min: {self.global_min_loss:.4f}",
             f"  Success rate (within 0.01): {self.success_rate:.2%}",
             f"  Best loss — mean: {self.mean_best_loss:.4f}, median: {self.median_best_loss:.4f}",
-            f"  Best loss percentiles:",
+            f"  Median best loss landscape percentile: {self.best_loss_landscape_percentile:.4f}%",
+            f"  Best loss percentiles (across runs):",
         ]
         for p, v in zip(pcts, pct_vals):
             lines.append(f"    {p:>3d}th: {v:.4f}")
         lines.append(f"  Mean steps to best: {self.steps_to_best.mean():.1f}")
         return "\n".join(lines)
+
+
+def compute_landscape_percentile(loss_value: float, landscape_losses: np.ndarray) -> float:
+    """What % of landscape configs have loss <= this value."""
+    return float(np.mean(landscape_losses <= loss_value) * 100)
 
 
 def run_optimizer_benchmark(
@@ -215,12 +240,11 @@ def run_optimizer_benchmark(
     n_runs: int = 10000,
     max_steps: int = 200,
     global_min_loss: float = 0.0,
-    batch_chunk: int = 2048,  # process this many runs at a time (memory)
+    batch_chunk: int = 2048,
 ) -> BenchmarkResult:
     """Run an optimizer from random initializations and collect metrics."""
 
     device = state.hidden.device
-    dtype = state.hidden.dtype
     all_final_losses = []
     all_best_losses = []
     all_steps_to_best = []
@@ -230,7 +254,6 @@ def run_optimizer_benchmark(
         chunk_end = min(chunk_start + batch_chunk, n_runs)
         chunk_size = chunk_end - chunk_start
 
-        # Random initialization: uniform in [-1.5, 1.5] so initial quantization covers all 3 values
         latent = torch.nn.Parameter(
             torch.empty(chunk_size, num_params, device=device, dtype=torch.float32).uniform_(-1.5, 1.5)
         )
@@ -242,21 +265,16 @@ def run_optimizer_benchmark(
 
         for step in range(max_steps):
             optimizer.zero_grad()
-
-            # Forward with STE
             losses = differentiable_forward(state, latent, lora_config, labels)
             total_loss = losses.sum()
             total_loss.backward()
-
             optimizer.step()
 
-            # Track best
             with torch.no_grad():
                 improved = losses < best_losses
                 best_losses = torch.where(improved, losses, best_losses)
                 steps_to_best = torch.where(improved, step, steps_to_best)
 
-        # Final evaluation (clean, no grad)
         with torch.no_grad():
             final_losses = differentiable_forward(state, latent, lora_config, labels)
             final_configs = ste_ternary(latent)
