@@ -85,12 +85,18 @@ def run_layers_batched(model, hidden: torch.Tensor, start: int, end: int) -> tor
 run_layers = run_layers_batched
 
 
-def compute_loss_batched(model, hidden: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Compute CE loss from final hidden states, all positions.
+def compute_loss_batched(model, hidden: torch.Tensor, labels: torch.Tensor,
+                         last_positions: torch.Tensor = None) -> torch.Tensor:
+    """Compute CE loss from final hidden states, at last positions only.
+
+    Using last-token-per-sequence loss avoids materializing a huge
+    [B, total_seq, 50257] logits tensor. With 4 sequences of 32 tokens,
+    we compute LM head at 4 positions instead of 128 (32× cheaper).
 
     Args:
         hidden: [B, seq, d]
         labels: [seq] flattened target tokens
+        last_positions: indices of last token per sequence (for labels)
 
     Returns:
         losses: [B]
@@ -98,13 +104,19 @@ def compute_loss_batched(model, hidden: torch.Tensor, labels: torch.Tensor) -> t
     B = hidden.shape[0]
     h = model.transformer.ln_f(hidden)
 
-    # LM head: [B, seq, vocab]
-    logits = h @ model.lm_head.weight.to(h.dtype).T
+    if last_positions is not None:
+        # Only compute LM head at prediction positions
+        # Position i predicts token i+1, so use positions [seq_per-2, 2*seq_per-2, ...]
+        h_sel = h[:, last_positions, :]  # [B, n_seq, d]
+        logits = h_sel @ model.lm_head.weight.to(h.dtype).T  # [B, n_seq, vocab]
+        target_tokens = labels[last_positions]  # [n_seq]
+    else:
+        logits = h @ model.lm_head.weight.to(h.dtype).T  # [B, seq, vocab]
+        target_tokens = labels
 
-    # CE loss over all positions, averaged
     losses = F.cross_entropy(
         logits.reshape(-1, logits.shape[-1]),
-        labels.unsqueeze(0).expand(B, -1).reshape(-1),
+        target_tokens.unsqueeze(0).expand(B, -1).reshape(-1),
         reduction="none",
     ).reshape(B, -1).mean(dim=1)
 
@@ -138,6 +150,12 @@ def enumerate_coupled(
         torch.arange(configs_per_layer, device=device),
         n_per,
     ).to(cfg.dtype)  # [256, 8]
+
+    # Positions for last-token-per-sequence loss
+    # Position (k+1)*seq_per - 2 predicts the last token of sequence k
+    last_positions = torch.arange(seq_per - 2, total_seq, seq_per, device=device)
+    # Corresponding label indices (shifted by 1)
+    label_positions = torch.arange(seq_per - 1, total_seq, seq_per, device=device)
 
     # Split layer-0 (outermost) configs across GPUs
     l0_per_gpu = configs_per_layer // num_gpus
@@ -195,8 +213,8 @@ def enumerate_coupled(
                 # Run layer adapter[2] (just 1 layer) batched
                 H_final = run_layers_batched(model, H2, adapter_layers[2], adapter_layers[2] + 1)
 
-                # Compute losses
-                batch_losses = compute_loss_batched(model, H_final, flat_labels)
+                # Compute losses (last-token-per-sequence only)
+                batch_losses = compute_loss_batched(model, H_final, flat_labels, last_positions)
 
             losses_out[write_idx:write_idx + configs_per_layer] = \
                 batch_losses.cpu().numpy().astype(np.float16)
