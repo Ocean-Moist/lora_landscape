@@ -17,13 +17,14 @@ def batched_forward(
     B_Q: torch.Tensor,   # [rank_q, d_model]
     B_V: torch.Tensor,   # [rank_v, d_model]
     alpha: float,
-    labels: torch.Tensor,  # [1, seq_len] or [seq_len]
-    lm_chunk_size: int = 8192,
+    labels: torch.Tensor,  # [1, seq_len]
+    lm_chunk_size: int = 32768,
 ) -> torch.Tensor:
     """Forward pass from LoRA layer through LM head for B configs.
 
-    The LM head matmul ([B*seq, 768] @ [768, 50257]) dominates memory.
-    We chunk it to allow large B for the cheaper attention + MLP ops.
+    Only computes loss for the LAST token prediction to minimize the LM head
+    bottleneck (50257-dim matmul). This is the single biggest optimization:
+    7x reduction in the dominant compute cost.
 
     Returns: [B] tensor of cross-entropy losses.
     """
@@ -50,7 +51,6 @@ def batched_forward(
     # 4. Attention — manual for short sequences (Flash Attention fails at large B with short seq)
     scale = hd ** -0.5
     scores = (Q @ K.transpose(-2, -1)) * scale  # [B, nh, seq, seq]
-    # Causal mask
     mask = torch.triu(torch.ones(seq, seq, device=Q.device, dtype=torch.bool), diagonal=1)
     scores.masked_fill_(mask, float("-inf"))
     attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(Q.dtype)
@@ -66,23 +66,20 @@ def batched_forward(
     # 7. Final layer norm
     h = state.ln_f(h)
 
-    # 8. Chunked LM head + cross-entropy (avoids materializing full [B, seq-1, 50257] logits)
-    h_shift = h[:, :-1, :].contiguous()  # [B, seq-1, 768]
-    lab = labels.squeeze(0)[1:]  # [seq-1]
-    seq_m1 = h_shift.shape[1]
+    # 8. LM head — LAST POSITION ONLY (position seq-2 predicts token seq-1)
+    h_last = h[:, -2, :]  # [B, 768] — second-to-last position predicts last token
+    target = labels.squeeze(0)[-1]  # scalar — the last token
 
+    # Chunked LM head + CE to manage memory for very large B
     losses = torch.empty(B, device=h.device, dtype=torch.float32)
-    for chunk_start in range(0, B, lm_chunk_size):
-        chunk_end = min(chunk_start + lm_chunk_size, B)
-        h_chunk = h_shift[chunk_start:chunk_end]  # [chunk, seq-1, 768]
-        cs = chunk_end - chunk_start
-        logits = h_chunk.reshape(cs * seq_m1, -1) @ state.lm_head_weight.T  # [chunk*seq_m1, vocab]
-        loss = F.cross_entropy(
+    for cs in range(0, B, lm_chunk_size):
+        ce = min(cs + lm_chunk_size, B)
+        logits = h_last[cs:ce] @ state.lm_head_weight.T  # [chunk, vocab]
+        losses[cs:ce] = F.cross_entropy(
             logits,
-            lab.repeat(cs),
+            target.expand(ce - cs),
             reduction="none",
-        ).view(cs, seq_m1).mean(dim=1)
-        losses[chunk_start:chunk_end] = loss
+        )
 
     return losses
 

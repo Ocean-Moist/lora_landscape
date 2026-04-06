@@ -9,7 +9,7 @@ class Config:
     lora_layer: int = 11  # last transformer layer — minimizes per-config compute
     lora_rank_q: int = 20
     lora_rank_v: int = 20
-    lora_alpha: float = 1.0
+    lora_alpha: float = 25.0
     lora_seed: int = 42
 
     # Eval — predict last token from preceding context
@@ -19,7 +19,7 @@ class Config:
     # Enumeration
     num_params: int = 40  # lora_rank_q + lora_rank_v
     num_gpus: int = 8
-    config_batch_size: int = 4096  # configs evaluated in one batched forward pass
+    config_batch_size: int = 32768  # configs evaluated in one batched forward pass
     dtype: torch.dtype = torch.float16
     checkpoint_interval: int = 1024  # batches between checkpoints
 
