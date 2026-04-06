@@ -9,6 +9,7 @@ dependencies = [
     "datasets>=3.0",
     "numpy>=2.0",
     "tqdm",
+    "scipy>=1.17.1",
 ]
 
 [tool.uv]

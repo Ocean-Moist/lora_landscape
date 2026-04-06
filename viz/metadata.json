@@ -1,0 +1,11 @@
+{
+  "resolution": 512,
+  "loss_min": 4.590103626251221,
+  "loss_max": 6.076651573181152,
+  "loss_mean": 5.348409652709961,
+  "loss_std": 0.2668038606643677,
+  "total_configs": 1073741824,
+  "num_params": 30,
+  "global_loss_min": 2.95703125,
+  "global_loss_max": 7.5859375
+}

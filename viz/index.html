@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LoRA Loss Landscape Explorer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; font-family: 'SF Mono', 'Fira Code', monospace; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; top: 20px; left: 20px;
+    color: #b0ffb0; font-size: 13px; line-height: 1.7;
+    pointer-events: none; text-shadow: 0 0 8px rgba(0,255,0,0.3);
+    z-index: 10;
+  }
+  #hud .title { font-size: 18px; font-weight: 700; color: #fff; margin-bottom: 8px; }
+  #hud .dim { color: #6a8; }
+  #controls {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    color: #888; font-size: 12px; text-align: center;
+    pointer-events: none; z-index: 10;
+  }
+  #controls kbd {
+    background: #222; border: 1px solid #444; border-radius: 3px;
+    padding: 1px 6px; color: #aaa;
+  }
+  #loading {
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    color: #fff; font-size: 16px; z-index: 20;
+  }
+  #colorbar {
+    position: fixed; right: 20px; top: 50%; transform: translateY(-50%);
+    width: 20px; height: 300px; border: 1px solid #444; z-index: 10;
+  }
+  #colorbar-labels {
+    position: fixed; right: 48px; top: 50%; transform: translateY(-50%);
+    height: 300px; display: flex; flex-direction: column;
+    justify-content: space-between; color: #999; font-size: 11px;
+    pointer-events: none; z-index: 10; text-align: right;
+  }
+  #tooltip {
+    position: fixed; display: none; background: rgba(0,0,0,0.85);
+    border: 1px solid #555; border-radius: 4px; padding: 8px 12px;
+    color: #ddd; font-size: 12px; pointer-events: none; z-index: 15;
+  }
+</style>
+</head>
+<body>
+
+<div id="loading">Loading landscape data...</div>
+
+<div id="hud">
+  <div class="title">LoRA Loss Landscape</div>
+  <div>Configs: <span id="hud-configs">-</span></div>
+  <div>Params: <span id="hud-params">30</span> binary</div>
+  <div>Loss: <span id="hud-min" class="dim">-</span> &ndash; <span id="hud-max" class="dim">-</span></div>
+  <div>Global min: <span id="hud-gmin">-</span></div>
+  <div>Resolution: <span id="hud-res">-</span></div>
+</div>
+
+<div id="controls">
+  <kbd>Left drag</kbd> orbit &nbsp; <kbd>Right drag</kbd> pan &nbsp;
+  <kbd>Scroll</kbd> zoom &nbsp; <kbd>R</kbd> reset camera
+</div>
+
+<canvas id="colorbar"></canvas>
+<div id="colorbar-labels">
+  <span id="cb-max">-</span>
+  <span id="cb-mid">-</span>
+  <span id="cb-min">-</span>
+</div>
+
+<div id="tooltip"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ---- Color palette (viridis-like: deep purple -> blue -> teal -> green -> yellow) ----
+function lossColor(t) {
+  // t in [0, 1], 0 = low loss (good), 1 = high loss (bad)
+  // Inverted for terrain: low loss = deep valleys = purple/blue, high loss = peaks = yellow
+  const colors = [
+    [0.267, 0.004, 0.329],  // deep purple (low loss / global min)
+    [0.282, 0.140, 0.458],  // purple
+    [0.212, 0.339, 0.549],  // blue
+    [0.128, 0.492, 0.545],  // teal
+    [0.153, 0.638, 0.467],  // green-teal
+    [0.360, 0.761, 0.337],  // green
+    [0.667, 0.851, 0.169],  // yellow-green
+    [0.993, 0.906, 0.144],  // yellow (high loss)
+  ];
+  const idx = t * (colors.length - 1);
+  const i = Math.min(Math.floor(idx), colors.length - 2);
+  const f = idx - i;
+  return [
+    colors[i][0] + f * (colors[i+1][0] - colors[i][0]),
+    colors[i][1] + f * (colors[i+1][1] - colors[i][1]),
+    colors[i][2] + f * (colors[i+1][2] - colors[i][2]),
+  ];
+}
+
+// ---- Draw colorbar ----
+function drawColorbar(lossMin, lossMax) {
+  const canvas = document.getElementById('colorbar');
+  canvas.width = 20; canvas.height = 300;
+  const ctx = canvas.getContext('2d');
+  for (let y = 0; y < 300; y++) {
+    const t = y / 299;  // top = high loss, bottom = low loss
+    const [r, g, b] = lossColor(1 - t);
+    ctx.fillStyle = `rgb(${r*255|0},${g*255|0},${b*255|0})`;
+    ctx.fillRect(0, y, 20, 1);
+  }
+  document.getElementById('cb-max').textContent = lossMax.toFixed(2);
+  document.getElementById('cb-mid').textContent = ((lossMin + lossMax) / 2).toFixed(2);
+  document.getElementById('cb-min').textContent = lossMin.toFixed(2);
+}
+
+// ---- Main ----
+async function main() {
+  // Load metadata
+  const metaResp = await fetch('metadata.json');
+  const meta = await metaResp.json();
+  const res = meta.resolution;
+
+  document.getElementById('hud-configs').textContent = meta.total_configs.toLocaleString();
+  document.getElementById('hud-params').textContent = meta.num_params;
+  document.getElementById('hud-min').textContent = meta.loss_min.toFixed(3);
+  document.getElementById('hud-max').textContent = meta.loss_max.toFixed(3);
+  document.getElementById('hud-gmin').textContent = meta.loss_min.toFixed(4);
+  document.getElementById('hud-res').textContent = `${res}x${res}`;
+
+  drawColorbar(meta.loss_min, meta.loss_max);
+
+  // Load heightmap
+  const hmResp = await fetch('heightmap.bin');
+  const hmBuf = await hmResp.arrayBuffer();
+  const heightmap = new Float32Array(hmBuf);
+
+  document.getElementById('loading').style.display = 'none';
+
+  // ---- Scene setup ----
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0a0a0f);
+  scene.fog = new THREE.FogExp2(0x0a0a0f, 0.0006);
+
+  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 2000);
+  camera.position.set(350, 320, 350);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  document.body.appendChild(renderer.domElement);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.05;
+  controls.maxPolarAngle = Math.PI * 0.48;
+  controls.target.set(0, 0, 0);
+
+  // ---- Build terrain mesh ----
+  const terrainSize = 500;
+  const heightScale = 300;  // vertical exaggeration for dramatic valleys
+
+  const geometry = new THREE.PlaneGeometry(terrainSize, terrainSize, res - 1, res - 1);
+  geometry.rotateX(-Math.PI / 2);
+
+  const positions = geometry.attributes.position.array;
+  const colors = new Float32Array(positions.length);
+
+  for (let i = 0; i < res * res; i++) {
+    const h = heightmap[i];
+    // Low loss (h~0) = deep valley, high loss (h~1) = peak
+    positions[i * 3 + 1] = (1.0 - h) * heightScale;
+
+    const [r, g, b] = lossColor(h);
+    colors[i * 3] = r;
+    colors[i * 3 + 1] = g;
+    colors[i * 3 + 2] = b;
+  }
+
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geometry.computeVertexNormals();
+
+  const material = new THREE.MeshPhongMaterial({
+    vertexColors: true,
+    shininess: 15,
+    side: THREE.DoubleSide,
+    flatShading: false,
+  });
+
+  const terrain = new THREE.Mesh(geometry, material);
+  scene.add(terrain);
+
+  // ---- Grid wireframe overlay (subtle) ----
+  const wireMat = new THREE.MeshBasicMaterial({
+    wireframe: true,
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.03,
+  });
+  const wireframe = new THREE.Mesh(geometry.clone(), wireMat);
+  scene.add(wireframe);
+
+  // ---- Lighting ----
+  const ambientLight = new THREE.AmbientLight(0x404060, 0.6);
+  scene.add(ambientLight);
+
+  const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+  dirLight.position.set(200, 300, 100);
+  scene.add(dirLight);
+
+  const dirLight2 = new THREE.DirectionalLight(0x8888ff, 0.3);
+  dirLight2.position.set(-200, 200, -100);
+  scene.add(dirLight2);
+
+  // ---- Mark global minimum ----
+  let minIdx = 0, minVal = heightmap[0];
+  for (let i = 1; i < heightmap.length; i++) {
+    if (heightmap[i] < minVal) { minVal = heightmap[i]; minIdx = i; }
+  }
+  const minRow = Math.floor(minIdx / res);
+  const minCol = minIdx % res;
+  const minX = (minCol / (res - 1) - 0.5) * terrainSize;
+  const minZ = (minRow / (res - 1) - 0.5) * terrainSize;
+  const minY = (1.0 - minVal) * heightScale;
+
+  // Glowing sphere at global min
+  const minGeo = new THREE.SphereGeometry(3, 16, 16);
+  const minMat = new THREE.MeshBasicMaterial({ color: 0xff00ff });
+  const minMarker = new THREE.Mesh(minGeo, minMat);
+  minMarker.position.set(minX, minY - 2, minZ);
+  scene.add(minMarker);
+
+  // Pulsing ring
+  const ringGeo = new THREE.RingGeometry(4, 6, 32);
+  ringGeo.rotateX(-Math.PI / 2);
+  const ringMat = new THREE.MeshBasicMaterial({ color: 0xff00ff, transparent: true, opacity: 0.5, side: THREE.DoubleSide });
+  const ring = new THREE.Mesh(ringGeo, ringMat);
+  ring.position.copy(minMarker.position);
+  scene.add(ring);
+
+  // ---- Raycaster for hover tooltip ----
+  const raycaster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2();
+  const tooltip = document.getElementById('tooltip');
+
+  renderer.domElement.addEventListener('mousemove', (e) => {
+    mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObject(terrain);
+    if (intersects.length > 0) {
+      const pt = intersects[0].point;
+      // Map back to grid coords
+      const col = Math.round(((pt.x / terrainSize) + 0.5) * (res - 1));
+      const row = Math.round(((pt.z / terrainSize) + 0.5) * (res - 1));
+      if (row >= 0 && row < res && col >= 0 && col < res) {
+        const h = heightmap[row * res + col];
+        const loss = meta.loss_min + h * (meta.loss_max - meta.loss_min);
+        tooltip.style.display = 'block';
+        tooltip.style.left = (e.clientX + 15) + 'px';
+        tooltip.style.top = (e.clientY - 10) + 'px';
+        tooltip.innerHTML = `Loss: <b>${loss.toFixed(3)}</b><br>Grid: (${col}, ${row})`;
+      }
+    } else {
+      tooltip.style.display = 'none';
+    }
+  });
+
+  // ---- Keyboard ----
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'r' || e.key === 'R') {
+      camera.position.set(350, 320, 350);
+      controls.target.set(0, 0, 0);
+    }
+  });
+
+  // ---- Resize ----
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // ---- Animate ----
+  const clock = new THREE.Clock();
+  function animate() {
+    requestAnimationFrame(animate);
+    const t = clock.getElapsedTime();
+
+    // Pulse the global min marker
+    const pulse = 1 + 0.3 * Math.sin(t * 3);
+    minMarker.scale.setScalar(pulse);
+    ring.scale.setScalar(1 + 0.5 * Math.sin(t * 2));
+    ringMat.opacity = 0.3 + 0.2 * Math.sin(t * 2);
+
+    controls.update();
+    renderer.render(scene, camera);
+  }
+  animate();
+}
+
+main();
+</script>
+</body>
+</html>

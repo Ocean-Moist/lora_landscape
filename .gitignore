@@ -14,3 +14,5 @@ build/
 
 # uv
 # uv.lock is committed for reproducibility
+results/
+viz/heightmap.bin
