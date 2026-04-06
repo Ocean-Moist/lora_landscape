@@ -13,7 +13,7 @@ class Config:
     lora_seed: int = 42
 
     # Eval — predict last token from preceding context
-    eval_text: str = "The quick brown fox jumps over the lazy"
+    eval_text: str = "The quick brown fox jumps over the lazy dog"
     seq_len: int = 8  # tokens of context
 
     # Enumeration
