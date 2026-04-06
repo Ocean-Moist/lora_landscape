@@ -40,15 +40,14 @@ class PrecomputedState:
         dtype: torch.dtype,
     ):
         with torch.no_grad():
-            # Run embedding + layers 0..(lora_layer-1)
-            hidden = model.transformer.wte(input_ids.to(device)) + model.transformer.wpe(
-                torch.arange(input_ids.shape[1], device=device)
+            # Use model's native forward to get hidden states at each layer
+            # output_hidden_states[i] = output of layer i-1 (0 = embedding output)
+            outputs = model.transformer(
+                input_ids.to(device),
+                output_hidden_states=True,
             )
-            hidden = hidden.to(dtype)  # [1, seq, 768]
-            for i in range(lora_layer):
-                hidden = model.transformer.h[i](hidden)[0]
-
-            # hidden: [1, seq, 768] — input to the LoRA layer
+            # hidden_states[0] = embedding, [1] = after layer 0, ..., [lora_layer] = after layer lora_layer-1
+            hidden = outputs.hidden_states[lora_layer]  # [1, seq, 768]
             self.hidden = hidden.squeeze(0)  # [seq, 768]
 
             # Extract the LoRA layer's attention weights
